@@ -2,18 +2,21 @@
 from __future__ import print_function
 import os
 import re
+import string
 import argparse
 import subprocess
 from os import path
 from textwrap import wrap
 from collections import defaultdict as dd
-from itertools import chain
+from itertools import chain, cycle
 from bisect import bisect_left
 
-# Constants
+## Constants
 colors = {'black': '30', 'blue': '34', 'cyan': '36', 'green': '32', 
           'magenta': '35', 'red': '31', 'white': '37', 'yellow': '33'}
 hi_color = 'red'
+nelson = False
+job_glyphs = cycle(string.letters+string.digits)
 
 blocks = {}
 blocks['not a node'] = ' '
@@ -32,19 +35,24 @@ sacct_cmd = ['sacct', '-XaPsR', '-oJobID,JobName,User,Account,NodeList']
 node_regex = re.compile('([a-z]+)(\d\d)*n?(\d\d*)')
 gpu_regex = re.compile('NodeName=([a-zA-Z\d\[\],\-]+).+Type=([\w\d]+)\W+.*')
 
-# Globals
+## Globals
 node_info = dd(lambda: {'block':blocks['not a node'], 'partition':set(), 
                         'feature':set(), 'user':set(), 'job':set(), 
-                        'account':set(), 'gpu':set(), 'highlight':False})
+                        'account':set(), 'gpu':set()})
+
+job_map = {}
 chassis_set = set()
 node_num_maxes = dd(lambda: 1)
-node_filters = []
 
+## Functions
 def get_pad(list_of_things):
     return max(map(len, list_of_things))+2
 
-def highlight(text):
+def highlight_node(text):
     return '\033[{}m{}\033[0m'.format(colors[hi_color], text)
+
+def _wrap(s, n):
+    return '\n'.join(wrap(s, n))
 
 def get_subprocess_lines(cmd):
     pipe = subprocess.Popen(cmd, stdout=subprocess.PIPE)
@@ -62,8 +70,7 @@ def print_legend():
     nu = 'node usage: '.ljust(pad)
     usage_legend = '|'.join(usage_chars)
     print('{}|{}|'.format(nu, usage_legend))
-    print('{}^1%{}100%^\n'.format(' ' * len(nu), ' ' * (len(usage_values)*2-7)))
-    
+    print('{}^1%{}100%^\n'.format(' ' * len(nu), ' ' * (len(usage_values)*2-7))) 
 
 def get_closest(nums, my_num):
     """
@@ -133,11 +140,12 @@ def get_gpus():
     with open(path.join(slurm_prefix, 'gres.conf')) as gres:
         for line in gres:
             gpu_match = gpu_regex.match(line)
-            groups = gpu_match.groups()
-            if groups is not None and groups[0] is not None and groups[1] is not None:
-                hostlist, gpu = groups
-                for node in expand_hostlist(hostlist):
-                    yield (node, gpu)
+            if gpu_match is not None:
+                groups = gpu_match.groups()
+                if groups is not None and groups[0] is not None and groups[1] is not None:
+                    hostlist, gpu = groups
+                    for node in expand_hostlist(hostlist):
+                        yield (node, gpu)
 
 def get_help():
     parts = set([x.split()[0] for x in get_subprocess_lines(['sinfo', '-h'])])
@@ -151,10 +159,10 @@ def get_help():
     return ('https://github.com/ycrc/Orwell-CLI\n'+
             'A utility to view slurm node status and usage.\n\n'+
             'Partitions found (* means default):\n'+
-            '\n'.join(wrap(', '.join(sorted(parts)), 80))+
+            _wrap(', '.join(sorted(parts)), 80)+
             '\n\n'+
             'GPUs found:\n'+
-            ''.join(wrap(', '.join(sorted(gpus)), 80))+
+            _wrap(', '.join(sorted(gpus)), 80)+
             '\n'
             )
 
@@ -177,24 +185,23 @@ def update_node_info(sinfo):
         total_mem = float(sinfo['MEMORY'])
         mem_usage = (total_mem - free_mem) / total_mem
 
-    if show_usage == 'cpu':
-        usage_block = get_usage_block(sinfo['STATE'], cpu_usage)
-    elif show_usage == 'ram':
-        usage_block = get_usage_block(sinfo['STATE'], mem_usage)
-    elif show_usage == 'both':
-        usage_block = (get_usage_block(sinfo['STATE'], cpu_usage) + 
-                       get_usage_block(sinfo['STATE'], mem_usage))
-           
     chassis, node_num = split_node(sinfo['HOSTNAMES'])
     chassis_set.add(chassis)
     node_name = '{}{:02d}'.format(chassis, node_num)
 
+    if show_usage == 'cpu':
+        node_info[node_name]['block'] = get_usage_block(sinfo['STATE'], cpu_usage)
+    elif show_usage == 'ram':
+        node_info[node_name]['block'] = get_usage_block(sinfo['STATE'], mem_usage)
+    elif show_usage == 'both':
+        node_info[node_name]['block'] = (get_usage_block(sinfo['STATE'], cpu_usage) + 
+                                         get_usage_block(sinfo['STATE'], mem_usage))
+ 
     if node_num_maxes[chassis] < node_num:
             node_num_maxes[chassis] = node_num
-    node_info[node_name]['block'] = usage_block
     node_info[node_name]['partition'].add(sinfo['PARTITION'])
     [node_info[node_name]['feature'].add(f) for f in sinfo['AVAIL_FEATURES'].split(',')]
-    return chassis, node_num
+    chassis_set.add(chassis)
 
 def update_job_info(sacct):
     for node in expand_hostlist(sacct['NodeList']):
@@ -202,17 +209,38 @@ def update_job_info(sacct):
         node_name = '{}{:02d}'.format(chassis, node_num)
         node_info[node_name]['job'].add(sacct['JobID']) 
         # also add array jobid
-        node_info[node_name]['job'].add(sacct['JobID'].split('_')[0])
+        base_jobid = sacct['JobID'].split('_')[0]
+        if show_usage == 'job':
+            if base_jobid not in job_map:
+                job_map[base_jobid] = next(job_glyphs)
+            node_info[node_name]['block'] = job_map[base_jobid]
+        node_info[node_name]['job'].add(base_jobid)
         node_info[node_name]['user'].add(sacct['User'])
         node_info[node_name]['account'].add(sacct['Account'])
 
-def filter_node(node_name, filter_tag, query):
-    if node_info[node_name]['highlight'] is False:
-        for sub_query in query.split(','):
-            if sub_query.lower() in node_info[node_name][filter_tag]:
-                node_info[node_name]['highlight'] = True
+def filter_node(node_name, highlight_mode, filter_tag, query):
+    bools = []
+    highlight = False
+    for sub_query in query.split(','):
+        if sub_query.lower() in node_info[node_name][filter_tag]:
+            bools.append(True)
+        else:
+            bools.append(False)
+    if highlight_mode == 'or':
+        return any(bools)
+    if highlight_mode == 'and':
+        return all(bools)
 
-def print_node_layout(chassis_set, show_usage):
+def parse_slurm(cmd, header_hint, update_func):
+    for line in get_subprocess_lines(cmd):
+        if line.startswith(header_hint):
+            header = re.split(' ?\|', line)
+        else:
+            slrm = dict(zip(header,re.split(' ?\|', line)))
+            update_func(slrm)
+
+def print_node_layout(chassis_set, show_usage, node_filters, highlight_mode):
+    chassis_pad = get_pad(chassis_set)
     for chassis in sorted(chassis_set):
         print((chassis+': ').ljust(chassis_pad), end='')
         line = []
@@ -221,14 +249,23 @@ def print_node_layout(chassis_set, show_usage):
             if show_usage == 'both' and node_info[node]['block'] == blocks['not a node']:
                 node_info[node]['block'] += blocks['not a node']
             if len(node_filters) != 0:
+                bools = []
+                highlight = False
                 for filt in node_filters:
-                    filter_node(node, *filt)
-            if node_info[node]['highlight']:
-                line.append(highlight(node_info[node]['block']))
+                    bools.append(filter_node(node, highlight_mode, *filt))
+                if highlight_mode == 'or':
+                    highlight = any(bools)
+                if highlight_mode == 'and':
+                    highlight = all(bools)
+                if highlight:
+                    line.append(highlight_node(node_info[node]['block']))
+                else:
+                    line.append(node_info[node]['block'])
             else:
                 line.append(node_info[node]['block'])
         print('|{}|'.format('|'.join(line)))
 
+## Main
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=get_help(), prog='orwell-cli', 
                                      formatter_class=argparse.RawTextHelpFormatter)
@@ -236,31 +273,48 @@ if __name__ == '__main__':
     parser.add_argument('-s', '--show',
                         default='cpu',
                         metavar='cpu|ram|both',
-                        choices=['cpu', 'ram', 'both'],
-                        help='Show proportion of allocated CPUs, RAM, or both. Order is CPU, RAM for both.')
+                        choices=['cpu', 'ram', 'both', 'job'],
+                        help=_wrap(('Show proportion of allocated CPUs, RAM, both, or job layout. '+
+                              'Order when displaying proportion of both is CPU, RAM. '+
+                              'Showing "job" will assign a letter or number to each job and display the '+
+                              'last job running on each node. Makes the most sense on clusers '+
+                              'with exclusive node allocation.'), 70))
     parser.add_argument('-l', '--legend',
                         action='store_true',
                         help='Show legend.')
     parser.add_argument('-c', '--color',
                         metavar='color',
-                        help='Color to use for highlighting. Default: {}\n  Options: {}'.format(hi_color, ', '.join(colors.keys())))
+                        help=('Color to use for highlighting. Default: ' +
+                              '{}\n  Options: {}'.format(hi_color, ', '.join(colors.keys()))))
+    parser.add_argument('-b', '--bool',
+                        default='or',
+                        choices=['and','or'],
+                        help=_wrap(('Logic to use when combining filters. "or" will highlight a node '+
+                            'if any of the filters match, "and" will only highlight a node if '+
+                            'all filters match. Default is "or".'), 70))
     parser.add_argument('-p', '--partition',
                         metavar='partition',
+                        action='append',
                         help='Highlight nodes that are members of the given partition(s), comma separated')
     parser.add_argument('-f', '--feature',
                         metavar='feature',
+                        action='append',
                         help='Highlight nodes with the given feature(s), comma separated')
     parser.add_argument('-g', '--gpu',
                         metavar='gpu_type',
+                        action='append',
                         help='Highlight nodes with the given gpu(s) available, comma separated')
     parser.add_argument('-j', '--job',
                         metavar='jobid',
+                        action='append',
                         help='Highlight nodes where jobs with jobid(s) are running, comma separated')
     parser.add_argument('-u', '--user',
                         metavar='user',
+                        action='append',
                         help='Highlight nodes where the given user(s) are running jobs, comma separated')
     parser.add_argument('-A', '--account',
                         metavar='account',
+                        action='append',
                         help='Highlight nodes where the given account(s) are running jobs, comma separated')
 
     args = vars(parser.parse_args())
@@ -273,38 +327,32 @@ if __name__ == '__main__':
         else:
             print('Unrecognized color "{}", using default.'.format(args.color))
     
+    node_filters = []
     for filt in ['partition', 'feature']:
         if args[filt] is not None:
-            node_filters.append((filt, args[filt]))
+            for f in args[filt]:
+                node_filters.append((filt, f))
     if args['gpu'] is not None:
-        node_filters.append(('gpu', args['gpu']))
+        for g in args['gpu']:
+            node_filters.append(('gpu', g))
         add_gpu_info()
 
     # get job/user info if asked
     get_job_info = False
     for filt in ['job', 'user', 'account']:
         if args[filt] is not None:
-            node_filters.append((filt, args[filt]))
+            for f in args[filt]:
+                node_filters.append((filt, f)) 
             get_job_info = True
+    if show_usage == 'job':
+        get_job_info = True
+
     if get_job_info:
-        for line in get_subprocess_lines(sacct_cmd):
-            if line.startswith('JobID|'):
-                header = line.rstrip().split('|')
-            else:
-                sacct = dict(zip(header, line.rstrip().split('|')))
-                update_job_info(sacct)
+        parse_slurm(sacct_cmd, 'JobID|', update_job_info)
 
     # get node/partition info
-    chassis_set = set()
-    for line in get_subprocess_lines(sinfo_cmd):
-        if line.startswith('AVAIL|'):
-            header = re.split(' ?\|', line)
-        else:
-            sinfo = dict(zip(header,re.split(' ?\|', line)))
-            chassis, node_number = update_node_info(sinfo)
-            chassis_set.add(chassis)
-    chassis_pad = get_pad(chassis_set)
+    parse_slurm(sinfo_cmd, 'AVAIL|', update_node_info)
     
     # print node layout
-    print_node_layout(chassis_set, show_usage)
+    print_node_layout(chassis_set, show_usage, node_filters, args['bool'])
 
